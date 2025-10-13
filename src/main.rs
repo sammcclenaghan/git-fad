@@ -1,13 +1,54 @@
+use anyhow::anyhow;
 use anyhow::{Context, Result};
 use git2::{Repository, Status, StatusOptions};
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-// Use the lib we added earlier which lists index entries and stages via libgit2.
-mod git;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileMode {
+    Regular,
+    Executable,
+    Symlink,
+    Submodule,
+    Other(u32),
+}
 
-use git::{FileEntry, FileMode, stage_paths_libgit2};
+#[derive(Debug, Clone)]
+pub struct FileEntry {
+    pub path: PathBuf,
+    pub mode: FileMode,
+}
+
+pub fn stage_paths_libgit2(repo_path: &Path, paths: &[PathBuf]) -> Result<()> {
+    let repo = Repository::open(repo_path)
+        .with_context(|| format!("opening git repository at {}", repo_path.display()))?;
+    let mut index = repo
+        .index()
+        .with_context(|| format!("reading index for repo {}", repo_path.display()))?;
+
+    for p in paths {
+        let rel = if p.is_absolute() {
+            p.strip_prefix(repo_path).map(PathBuf::from).map_err(|_| {
+                anyhow!(
+                    "path {} is not inside repository {}",
+                    p.display(),
+                    repo_path.display()
+                )
+            })?
+        } else {
+            p.clone()
+        };
+
+        index
+            .add_path(&rel)
+            .with_context(|| format!("adding {} to index", rel.display()))?;
+    }
+
+    index.write().context("writing index after staging paths")?;
+
+    Ok(())
+}
 
 // Use the high-performance matcher crate
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -34,12 +75,6 @@ fn collect_unstaged_and_untracked(repo_path: &std::path::Path) -> Result<Vec<Fil
     for entry in statuses.iter() {
         let s = entry.status();
 
-        // Only include files that can be staged:
-        // - WT_NEW: untracked files
-        // - WT_MODIFIED: modified files in working tree
-        // - WT_DELETED: deleted files in working tree
-        // - WT_TYPECHANGE: type changed files in working tree
-        // - WT_RENAMED: renamed files in working tree
         if s.intersects(
             Status::WT_NEW
                 | Status::WT_MODIFIED
@@ -48,7 +83,6 @@ fn collect_unstaged_and_untracked(repo_path: &std::path::Path) -> Result<Vec<Fil
                 | Status::WT_RENAMED,
         ) {
             if let Some(p) = entry.path() {
-                // Treat all as Regular files for simplicity - git2 will handle the actual staging correctly
                 entries.push(FileEntry {
                     path: PathBuf::from(p),
                     mode: FileMode::Regular,
@@ -61,18 +95,17 @@ fn collect_unstaged_and_untracked(repo_path: &std::path::Path) -> Result<Vec<Fil
 }
 
 fn main() -> Result<()> {
-    let mut args = env::args().skip(1);
     let prog = env::args().next().unwrap_or_else(|| "git-fad".into());
-
-    // Expect a single query argument (it may contain spaces if quoted)
-    let query = match args.next() {
-        Some(q) => q,
-        None => {
-            eprintln!("Usage: {} <query>", prog);
-            eprintln!("Example: {} Cargo", prog);
-            return Ok(());
-        }
-    };
+    // Collect all remaining CLI args as independent fuzzy tokens
+    let tokens: Vec<String> = env::args().skip(1).collect();
+    if tokens.is_empty() {
+        eprintln!("Usage: {} <query tokens...>", prog);
+        eprintln!("Examples:");
+        eprintln!("  {} cargo", prog);
+        eprintln!("  {} packages book type spec", prog);
+        eprintln!("  {} src main rs", prog);
+        return Ok(());
+    }
 
     let repo_path = std::env::current_dir()?;
 
@@ -98,21 +131,85 @@ fn main() -> Result<()> {
     // 3) Create a matcher with path-friendly config
     let mut matcher: Matcher = Matcher::new(MatcherConfig::DEFAULT.match_paths());
 
-    // 4) Parse the query into a Pattern (word segmentation etc.)
-    let pattern = Pattern::parse(&query, CaseMatching::Ignore, Normalization::Smart);
+    // 4) Multi-token fuzzy matching:
+    // We treat each CLI token as a required fuzzy pattern. A candidate must match ALL tokens.
+    // We sum (aggregate) the individual token scores, and finally break ties by preferring
+    // shorter paths (heuristic for "more specific").
+    //
+    // Algorithm:
+    //   cumulative = empty map
+    //   for each token:
+    //       run fuzzy over full haystack -> map_this
+    //       if first token: cumulative = map_this
+    //       else: cumulative = intersection(cumulative, map_this) with scores added
+    //   pick max score; tie -> shorter path; next tie -> lexical
+    use std::collections::HashMap;
 
-    // 5) Run matches over the haystack using the matcher
-    // The `match_list` convenience returns a Vec<(&str, score)> for matches
-    let matches = pattern.match_list(&hay_refs, &mut matcher);
+    let mut cumulative: HashMap<&str, u32> = HashMap::new();
+    let mut first = true;
 
-    if matches.is_empty() {
-        println!("No matches for query: {}", query);
+    for tok in &tokens {
+        let pattern = Pattern::parse(tok, CaseMatching::Ignore, Normalization::Smart);
+        let token_matches = pattern.match_list(&hay_refs, &mut matcher);
+
+        if token_matches.is_empty() {
+            // Early exit: one token matched nothing => overall no result
+            println!("No matches (token '{}' matched nothing)", tok);
+            return Ok(());
+        }
+
+        if first {
+            for (p, score) in token_matches {
+                cumulative.insert(p, score);
+            }
+            first = false;
+        } else {
+            // Build lookup for this token
+            let mut this_map: HashMap<&str, u32> = HashMap::with_capacity(token_matches.len());
+            for (p, score) in token_matches {
+                this_map.insert(p, score);
+            }
+            // Retain only candidates also matched by this token; add their score
+            cumulative.retain(|p, total_score| {
+                if let Some(s) = this_map.get(p) {
+                    *total_score += *s;
+                    true
+                } else {
+                    false
+                }
+            });
+            if cumulative.is_empty() {
+                println!("No matches after applying tokens: {}", tokens.join(" "));
+                return Ok(());
+            }
+        }
+    }
+
+    if cumulative.is_empty() {
+        println!("No matches for query tokens: {}", tokens.join(" "));
         return Ok(());
     }
 
-    // 6) The first element is the best match (Pattern::match_list returns in descending score)
-    let &(best_path_str, best_score) = &matches[0];
-    println!("Best match: {} (score={})", best_path_str, best_score);
+    // Select best (score desc, then shorter path, then lexical)
+    let (best_path_str, best_score) = cumulative
+        .into_iter()
+        .max_by(|(pa, sa), (pb, sb)| {
+            // Order by:
+            // 1. Higher aggregate score
+            // 2. Shorter path
+            // 3. Lexicographical order
+            sa.cmp(sb)
+                .then_with(|| pb.len().cmp(&pa.len())) // shorter path wins
+                .then_with(|| pa.cmp(pb))
+        })
+        .expect("non-empty cumulative map just ensured");
+
+    println!(
+        "Best match: {} (aggregate_score={}, tokens={})",
+        best_path_str,
+        best_score,
+        tokens.join("+")
+    );
 
     // 7) Convert the matched string back to a repository-relative PathBuf and stage it
     // Build a small lookup map from hay path -> index so we can reliably find the matched index
