@@ -1,6 +1,7 @@
 use anyhow::anyhow;
 use anyhow::{Context, Result};
 use git2::{Repository, Status, StatusOptions};
+use globset::{Glob, GlobMatcher};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as MatcherConfig, Matcher};
 use std::collections::HashMap;
@@ -10,6 +11,41 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub path: PathBuf,
+}
+
+fn token_to_index_scores<'a>(
+    token: &str,
+    hay_refs: &[&'a str],
+    index_map: &HashMap<&'a str, usize>,
+    matcher: &mut Matcher,
+) -> HashMap<usize, u32> {
+    let is_glob = token.contains('*');
+
+    if is_glob {
+        match Glob::new(token) {
+            Ok(glob) => {
+                let gm: GlobMatcher = glob.compile_matcher();
+                hay_refs
+                    .iter()
+                    .filter_map(|p| {
+                        if gm.is_match(p) {
+                            index_map.get(p).map(|i| (*i, 1u32))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
+            Err(_) => HashMap::new(),
+        }
+    } else {
+        let pattern = Pattern::parse(token, CaseMatching::Ignore, Normalization::Smart);
+        let token_matches = pattern.match_list(hay_refs, matcher);
+        token_matches
+            .into_iter()
+            .filter_map(|(p, score)| index_map.get(p).map(|i| (*i, score)))
+            .collect()
+    }
 }
 
 fn collect_unstaged_and_untracked(repo_path: &Path) -> Result<Vec<FileEntry>> {
@@ -118,28 +154,22 @@ fn main() -> Result<()> {
     let mut first = true;
 
     for tok in &tokens {
-        let pattern = Pattern::parse(tok, CaseMatching::Ignore, Normalization::Smart);
-        let token_matches = pattern.match_list(&hay_refs, &mut matcher);
+        let tok_map = token_to_index_scores(tok, &hay_refs, &index_map, &mut matcher);
 
-        if token_matches.is_empty() {
+        if tok_map.is_empty() {
             // Early exit: one token matched nothing => overall no result
             println!("No matches (token '{}' matched nothing)", tok);
             return Ok(());
         }
 
-        let this_map: HashMap<usize, u32> = token_matches
-            .into_iter()
-            .filter_map(|(p, score)| index_map.get(p).map(|i| (*i, score)))
-            .collect();
-
         if first {
-            cumulative = this_map;
+            cumulative = tok_map;
             first = false;
         } else {
             // intersect: keep only indices present in both maps, summing their scores
             cumulative = cumulative
                 .into_iter()
-                .filter_map(|(idx, total)| this_map.get(&idx).map(|s| (idx, total + s)))
+                .filter_map(|(idx, total)| tok_map.get(&idx).map(|s| (idx, total + s)))
                 .collect();
             if cumulative.is_empty() {
                 println!("No matches after applying tokens: {}", tokens.join(" "));
