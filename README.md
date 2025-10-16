@@ -42,10 +42,10 @@ git-fad "partial-name"
 git fad "partial-name"
 
 # Examples:
-git-fad "cargo"        # Might match Cargo.toml or Cargo.lock
-git-fad "main"         # Might match src/main.rs
-git-fad "test"         # Might match test_file.txt
-git-fad "readme"       # Might match README.md
+git fad "cargo"        # Might match Cargo.toml or Cargo.lock
+git fad "main"         # Might match src/main.rs
+git fad "test"         # Might match test_file.txt
+git fad "readme"       # Might match README.md
 ```
 
 ## How It Works
@@ -91,18 +91,6 @@ No matches for query: nonexistent
 $ git-fad "anything"
 No unstaged or untracked files found in repository /path/to/repo
 ```
-
-## Configuration
-
-Currently, `git-fad` uses sensible defaults:
-- Case-insensitive matching
-- Path-aware fuzzy matching (optimized for file paths)
-- Smart normalization (handles different input styles)
-
-## Requirements
-
-- Git repository (the tool must be run from within a Git repository)
-- Rust 1.70+ (for building from source)
 
 ## Dependencies
 
